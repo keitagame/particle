@@ -1,0 +1,483 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8" />
+  <title>Particle Life (WebGL1 + Canvas2D fallback, 7 colors)</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <style>
+    html, body {
+      margin: 0; padding: 0; background: #111; color: #ddd; height: 100%;
+      font-family: system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif;
+    }
+    #wrap { position: relative; width: 100vw; height: 100vh; overflow: hidden; }
+    canvas { display: block; width: 100%; height: 100%; }
+    .hud {
+      position: absolute; left: 8px; top: 8px; font-size: 12px; background: rgba(0,0,0,0.35);
+      padding: 6px 8px; border-radius: 6px; user-select: none; pointer-events: none;
+    }
+    .hud b { color: #fff; }
+  </style>
+</head>
+<body>
+  <div id="wrap">
+    <canvas id="glcanvas"></canvas>
+    <div class="hud" id="hud">init…</div>
+  </div>
+
+  <script>
+  // =========================
+  // CONFIG (調整ポイント)
+  // =========================
+  const CONFIG = {
+    NUM_PARTICLES: 4000,       // 粒子数（CPU更新／Canvas fallbackを考慮すると1万以下推奨）
+    NUM_SPECIES: 7,            // 7色（7種）
+    DT: 17.7,                   // 時間刻み
+    DAMPING: 0.8,             // 速度減衰（0〜1）
+    MAX_SPEED: 10,            // 安定のため速度クランプ
+    WORLD_MARGIN: 0,           // 0でトーラス（ラップ）。>0で反射境界バッファ（今回は0推奨）
+    INTERACTION_RADIUS: 20,    // 相互作用半径（グリッドセルもこれに合わせる）
+    R_MIN: 1.5,                // 近距離の排他しきい（反発開始）
+    FORCE_SCALE: 2,           // 力のスケール
+    GRID_SCALE: 1.0,           // グリッドセル倍率（1.0で半径と同等）
+    POINT_SIZE: 1.0,           // WebGLでの点サイズ（ピクセル）
+    BACKGROUND: "#000000",
+    COLORS: [
+      "#ff595e", "#ffca3a", "#8ac926", "#1982c4", "#6a4c93", "#00d3b7", "#f070a1"
+    ],
+    // 相互作用行列 A[i][j]: 種iが種jに対して感じる力の符号と強さ（-1〜1推奨）
+    // 対称でなくてOK。面白さのためランダム初期化＋固定シード。
+    RANDOM_MATRIX_SEED: 1197,
+    MATRIX_STRENGTH: 0.5    // 係数スケール（-1〜1に収めつつ全体の強度を調整）
+  };
+
+  // =========================
+  // 乱数（固定シード）
+  // =========================
+  function mulberry32(seed) {
+    return function() {
+      let t = seed += 0x6D2B79F5;
+      t = Math.imul(t ^ (t >>> 15), t | 1);
+      t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+
+  // =========================
+  // キャンバス初期化
+  // =========================
+  const wrap = document.getElementById('wrap');
+  const canvas = document.getElementById('glcanvas');
+  const hudEl = document.getElementById('hud');
+  let W = 0, H = 0, DPR = Math.max(1, Math.min(2, window.devicePixelRatio || 1));
+  function resize() {
+    const rect = wrap.getBoundingClientRect();
+    W = Math.max(320, Math.floor(rect.width));
+    H = Math.max(240, Math.floor(rect.height));
+    canvas.width = Math.floor(W * DPR);
+    canvas.height = Math.floor(H * DPR);
+    canvas.style.width = W + "px";
+    canvas.style.height = H + "px";
+  }
+  window.addEventListener('resize', resize, {passive: true});
+  resize();
+
+  // =========================
+  // 粒子データ
+  // =========================
+  const N = CONFIG.NUM_PARTICLES|0;
+  const S = CONFIG.NUM_SPECIES|0;
+  const pos = new Float32Array(N * 2);
+  const vel = new Float32Array(N * 2);
+  const species = new Uint8Array(N);
+
+  // 色（RGBA 0..1）
+  function hexToRgba01(hex) {
+    const n = parseInt(hex.replace("#",""), 16);
+    const r = ((n >> 16) & 255) / 255;
+    const g = ((n >> 8) & 255) / 255;
+    const b = (n & 255) / 255;
+    return [r,g,b,1];
+  }
+  const speciesColors = CONFIG.COLORS.slice(0, S).map(hexToRgba01);
+
+  // 相互作用行列 A[i][j]
+  const rng = mulberry32(CONFIG.RANDOM_MATRIX_SEED|0);
+  const A = Array.from({length: S}, ()=> new Float32Array(S));
+  for (let i=0;i<S;i++){
+    for (let j=0;j<S;j++){
+      const r = (rng()*2 - 1) * CONFIG.MATRIX_STRENGTH; // -1..1
+      A[i][j] = r;
+    }
+  }
+
+  // 初期配置（ランダム散布）、速度0
+  function initParticles(){
+    for (let i=0;i<N;i++){
+      pos[2*i+0] = Math.random() * W;
+      pos[2*i+1] = Math.random() * H;
+      vel[2*i+0] = (Math.random()*2-1)*10;
+      vel[2*i+1] = (Math.random()*2-1)*10;
+      species[i] = (i % S);
+    }
+  }
+
+  // =========================
+  // 近傍探索グリッド
+  // =========================
+  const R = CONFIG.INTERACTION_RADIUS;
+  const CELL = Math.max(8, Math.floor(R * CONFIG.GRID_SCALE));
+  let gridW=0, gridH=0;
+  let head, next, cellCount;
+  function resizeGrid(){
+    gridW = Math.max(1, Math.ceil(W / CELL));
+    gridH = Math.max(1, Math.ceil(H / CELL));
+    head = new Int32Array(gridW * gridH).fill(-1);
+    next = new Int32Array(N);
+    cellCount = 0;
+  }
+
+  function cellIndex(x, y){
+    let cx = Math.floor(x / CELL);
+    let cy = Math.floor(y / CELL);
+    // トーラス前提のラップ
+    cx = (cx % gridW + gridW) % gridW;
+    cy = (cy % gridH + gridH) % gridH;
+    return cy * gridW + cx;
+  }
+
+  function buildGrid(){
+    head.fill(-1);
+    for (let i=0;i<N;i++){
+      const x = pos[2*i], y = pos[2*i+1];
+      const c = cellIndex(x, y);
+      next[i] = head[c];
+      head[c] = i;
+    }
+  }
+
+  // =========================
+  // 力関数（単純・滑らか）
+  // - r < R_MIN で強い反発
+  // - R_MIN <= r < R で A[i][j]に応じた引力/斥力（距離に応じて減衰）
+  // =========================
+  function pairForce(s_i, s_j, r){
+    const a = A[s_i][s_j];
+    if (r < CONFIG.R_MIN) {
+      return -1.0; // 近距離反発（正規化前、ベクトル方向に掛ける前のスカラー）
+    }
+    if (r >= R) return 0.0;
+    const t = (r - CONFIG.R_MIN) / Math.max(1e-6, (R - CONFIG.R_MIN)); // 0..1
+    // 距離で滑らかに変化する引力/斥力。端で0、中央〜終盤で最大。
+    // 例: 余弦ウェイトを適用し、aにスケール
+    const w = (1 - Math.cos(Math.PI * t)) * 0.5; // 0..1
+    return a * w;
+  }
+
+  // =========================
+  // 物理更新
+  // =========================
+  function step(dt){
+    buildGrid();
+
+    const maxV = CONFIG.MAX_SPEED;
+    const rMin = CONFIG.R_MIN;
+    const rMax = R;
+    const fs = CONFIG.FORCE_SCALE;
+
+    for (let i=0;i<N;i++){
+      let ax=0, ay=0;
+      const xi = pos[2*i], yi = pos[2*i+1];
+      const si = species[i];
+
+      // 周囲8セル＋中心セル = 9セルを走査
+      const cx = Math.floor(xi / CELL);
+      const cy = Math.floor(yi / CELL);
+
+      for (let dy=-1; dy<=1; dy++){
+        for (let dx=-1; dx<=1; dx++){
+          // ラップ座標
+          let nx = (cx + dx + gridW) % gridW;
+          let ny = (cy + dy + gridH) % gridH;
+          let idx = head[ny * gridW + nx];
+          while (idx !== -1){
+            if (idx !== i) {
+              const xj = pos[2*idx], yj = pos[2*idx+1];
+              // トーラス距離（最短側へ）
+              let dxp = xj - xi;
+              let dyp = yj - yi;
+              if (dxp >  W*0.5) dxp -= W; else if (dxp < -W*0.5) dxp += W;
+              if (dyp >  H*0.5) dyp -= H; else if (dyp < -H*0.5) dyp += H;
+
+              const r2 = dxp*dxp + dyp*dyp;
+              if (r2 > 0 && r2 < rMax*rMax){
+                const r = Math.sqrt(r2);
+                // 力の大きさ（スカラー）
+                let f = pairForce(si, species[idx], r);
+                if (f !== 0){
+                  // 正規化方向
+                  const invr = 1.0 / r;
+                  ax += (dxp * invr) * f;
+                  ay += (dyp * invr) * f;
+                }
+              }
+            }
+            idx = next[idx];
+          }
+        }
+      }
+
+      // スケール適用
+      ax *= fs;
+      ay *= fs;
+
+      // 速度更新＋減衰
+      let vx = (vel[2*i]   + ax * dt) * CONFIG.DAMPING;
+      let vy = (vel[2*i+1] + ay * dt) * CONFIG.DAMPING;
+
+      // クランプ
+      const v2 = vx*vx + vy*vy;
+      if (v2 > maxV*maxV){
+        const inv = maxV / Math.sqrt(v2);
+        vx *= inv; vy *= inv;
+      }
+
+      vel[2*i] = vx; vel[2*i+1] = vy;
+
+      // 位置更新（トーラス）
+      let x = xi + vx * dt;
+      let y = yi + vy * dt;
+
+      if (CONFIG.WORLD_MARGIN === 0){
+        if (x < 0) x += W; else if (x >= W) x -= W;
+        if (y < 0) y += H; else if (y >= H) y -= H;
+      } else {
+        // 反射境界にしたい場合（今回は未使用）
+        if (x < 0 || x >= W){ vel[2*i] = -vel[2*i]; x = Math.max(0, Math.min(W-1, x)); }
+        if (y < 0 || y >= H){ vel[2*i+1] = -vel[2*i+1]; y = Math.max(0, Math.min(H-1, y)); }
+      }
+
+      pos[2*i] = x; pos[2*i+1] = y;
+    }
+  }
+
+  // =========================
+  // レンダリング（WebGL1 or Canvas2D）
+  // =========================
+  let gl = null;
+  try {
+    gl = canvas.getContext('webgl', {antialias: false, alpha: false, preserveDrawingBuffer: false})
+      || canvas.getContext('experimental-webgl');
+  } catch (e) { gl = null; }
+
+  let usingWebGL = !!gl;
+  let ctx2d = null;
+
+  // --- WebGL path ---
+  let prog = null, bufPos = null, bufCol = null, uRes = null, aPos = -1, aCol = -1, uPointSize = null;
+
+  function createShader(type, src){
+    const s = gl.createShader(type);
+    gl.shaderSource(s, src);
+    gl.compileShader(s);
+    if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)){
+      console.warn(gl.getShaderInfoLog(s));
+      gl.deleteShader(s);
+      return null;
+    }
+    return s;
+  }
+
+  function linkProgram(vs, fs){
+    const p = gl.createProgram();
+    gl.attachShader(p, vs);
+    gl.attachShader(p, fs);
+    gl.linkProgram(p);
+    if (!gl.getProgramParameter(p, gl.LINK_STATUS)){
+      console.warn(gl.getProgramInfoLog(p));
+      gl.deleteProgram(p);
+      return null;
+    }
+    return p;
+  }
+
+  function initGL(){
+    const vsSrc = `
+      attribute vec2 aPos;
+      attribute vec4 aCol;
+      uniform vec2 uRes;
+      uniform float uPointSize;
+      varying vec4 vCol;
+      void main(){
+        // ピクセル座標 -> クリップ座標
+        vec2 p = (aPos / uRes) * 2.0 - 1.0;
+        p.y = -p.y;
+        gl_Position = vec4(p, 0.0, 1.0);
+        gl_PointSize = uPointSize;
+        vCol = aCol;
+      }
+    `;
+    const fsSrc = `
+      precision mediump float;
+      varying vec4 vCol;
+      void main(){
+        // エフェクトなし：単色の正方形ポイント
+        gl_FragColor = vCol;
+      }
+    `;
+    const vs = createShader(gl.VERTEX_SHADER, vsSrc);
+    const fs = createShader(gl.FRAGMENT_SHADER, fsSrc);
+    prog = linkProgram(vs, fs);
+    gl.deleteShader(vs); gl.deleteShader(fs);
+
+    aPos = gl.getAttribLocation(prog, "aPos");
+    aCol = gl.getAttribLocation(prog, "aCol");
+    uRes = gl.getUniformLocation(prog, "uRes");
+    uPointSize = gl.getUniformLocation(prog, "uPointSize");
+
+    bufPos = gl.createBuffer();
+    bufCol = gl.createBuffer();
+
+    // カラーバッファは固定（種ごと）
+    const col = new Float32Array(N * 4);
+    for (let i=0;i<N;i++){
+      const c = speciesColors[species[i]];
+      col[4*i+0] = c[0];
+      col[4*i+1] = c[1];
+      col[4*i+2] = c[2];
+      col[4*i+3] = 1.0;
+    }
+    gl.bindBuffer(gl.ARRAY_BUFFER, bufCol);
+    gl.bufferData(gl.ARRAY_BUFFER, col, gl.STATIC_DRAW);
+
+    gl.disable(gl.DEPTH_TEST);
+    gl.disable(gl.BLEND); // エフェクトなし
+    gl.clearColor(
+      parseInt(CONFIG.BACKGROUND.slice(1,3),16)/255,
+      parseInt(CONFIG.BACKGROUND.slice(3,5),16)/255,
+      parseInt(CONFIG.BACKGROUND.slice(5,7),16)/255,
+      1
+    );
+  }
+
+  // --- Canvas2D path ---
+  function init2D(){
+    ctx2d = canvas.getContext('2d', {alpha: false});
+  }
+
+  function drawGL(){
+    gl.viewport(0, 0, canvas.width, canvas.height);
+    gl.clear(gl.COLOR_BUFFER_BIT);
+
+    // 位置
+    gl.bindBuffer(gl.ARRAY_BUFFER, bufPos);
+    gl.bufferData(gl.ARRAY_BUFFER, pos, gl.DYNAMIC_DRAW);
+    gl.useProgram(prog);
+    gl.uniform2f(uRes, W, H);
+    gl.uniform1f(uPointSize, CONFIG.POINT_SIZE * DPR);
+
+    gl.enableVertexAttribArray(aPos);
+    gl.vertexAttribPointer(aPos, 2, gl.FLOAT, false, 0, 0);
+
+    gl.bindBuffer(gl.ARRAY_BUFFER, bufCol);
+    gl.enableVertexAttribArray(aCol);
+    gl.vertexAttribPointer(aCol, 4, gl.FLOAT, false, 0, 0);
+
+    gl.drawArrays(gl.POINTS, 0, N);
+  }
+
+  function draw2D(){
+    // 背景クリア
+    ctx2d.fillStyle = CONFIG.BACKGROUND;
+    ctx2d.fillRect(0, 0, canvas.width, canvas.height);
+
+    const ps = Math.max(1, Math.floor(CONFIG.POINT_SIZE * DPR));
+    for (let i=0;i<N;i++){
+      const c = CONFIG.COLORS[species[i] % S];
+      ctx2d.fillStyle = c;
+      const x = Math.floor(pos[2*i] * DPR);
+      const y = Math.floor(pos[2*i+1] * DPR);
+      ctx2d.fillRect(x, y, ps, ps);
+    }
+  }
+
+  // =========================
+  // ループ
+  // =========================
+  function updateHud(fps){
+    hudEl.innerHTML =
+      `<b>Particle Life</b><br>`+
+      `renderer: ${usingWebGL ? 'WebGL1' : 'Canvas2D'}<br>`+
+      `particles: ${N}<br>`+
+      `fps: ${fps.toFixed(1)}<br>`+
+      `cell: ${CELL}px  grid: ${gridW}×${gridH}`;
+  }
+
+  let lastT = performance.now();
+  let fpsAcc=0, fpsFrames=0, fpsOut=0;
+
+  function frame(t){
+    const dtMs = t - lastT;
+    lastT = t;
+    const dt = Math.min(50, dtMs) / 1000; // 安定のためクランプ（秒）
+    const simDt = CONFIG.DT * dt * 60.0 * (1/60); // DTを基準化（実質 DT*dt）
+
+    // サイズ変化検知（レスポンシブ）
+    const rect = wrap.getBoundingClientRect();
+    const newW = Math.max(320, Math.floor(rect.width));
+    const newH = Math.max(240, Math.floor(rect.height));
+    const needResize = (newW !== W || newH !== H);
+    if (needResize){
+      resize();
+      resizeGrid();
+    }
+
+    step(simDt);
+
+    if (usingWebGL){
+      drawGL();
+    } else {
+      draw2D();
+    }
+
+    // FPS計測
+    fpsAcc += 1000 / Math.max(1e-3, dtMs);
+    fpsFrames++;
+    if (fpsAcc >= 10){ // 約10サンプルで更新
+      fpsOut = fpsAcc / fpsFrames;
+      fpsAcc = 0; fpsFrames = 0;
+      updateHud(fpsOut);
+    }
+
+    requestAnimationFrame(frame);
+  }
+
+  // =========================
+  // 起動
+  // =========================
+  function start(){
+    initParticles();
+    resizeGrid();
+
+    if (usingWebGL){
+      initGL();
+    } else {
+      init2D();
+    }
+
+    requestAnimationFrame(frame);
+  }
+
+  start();
+
+  // 任意：クリックで相互作用行列をランダム再生成
+  window.addEventListener('click', () => {
+    const rng2 = mulberry32((CONFIG.RANDOM_MATRIX_SEED + Math.floor(Math.random()*1e9))|0);
+    for (let i=0;i<S;i++){
+      for (let j=0;j<S;j++){
+        A[i][j] = (rng2()*2 - 1) * CONFIG.MATRIX_STRENGTH;
+      }
+    }
+  });
+  </script>
+</body>
+</html>
